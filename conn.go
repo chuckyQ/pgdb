@@ -257,6 +257,24 @@ func (p *PGConnection) readMessage() (byte, []byte, error) {
 	return msgType, payload, nil
 }
 
+func (p *PGConnection) Query(query string) ([][]bool, [][]string, []string, error) {
+
+	err := p.sendQuery(query)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	nulls, data, headers, err := p.readResults()
+
+	columns := make([]string, len(headers))
+	for _, h := range headers {
+		columns = append(columns, h.name)
+	}
+
+	return nulls, data, columns, err
+
+}
+
 // sendQuery sends PostgreSQL's Simple Query message.
 //
 // Message layout:
@@ -497,40 +515,38 @@ func parseSCRAMAttributes(s string) map[string]string {
 }
 
 // readResults consumes PostgreSQL messages resulting from the query.
-func (p *PGConnection) readResults() error {
+func (p *PGConnection) readResults() ([][]bool, [][]string, []*tableRowDescription, error) {
 
+	tableHeaderDescriptors := []*tableRowDescription{}
+	dataRows := [][]string{}
+	nullRows := [][]bool{}
 	for {
 		msgType, payload, err := p.readMessage()
 		if err != nil {
-			return err
+			return nullRows, dataRows, tableHeaderDescriptors, err
 		}
 
 		switch msgType {
 
 		case 'T':
 			// RowDescription.
-			printRowDescription(payload)
+			tableHeaderDescriptors = parseRowDescription(payload)
 
 		case 'D':
 			// DataRow.
-			printDataRow(payload)
+			nr, dr := parseDataRow(payload)
+			dataRows = append(dataRows, dr)
+			nullRows = append(nullRows, nr)
 
 		case 'C':
 			// CommandComplete.
-			fmt.Printf(
-				"CommandComplete: %s\n",
-				strings.TrimRight(string(payload), "\x00"),
-			)
 
 		case 'Z':
 			// ReadyForQuery.
-			fmt.Println("ReadyForQuery")
-			return nil
+			return nullRows, dataRows, tableHeaderDescriptors, nil
 
 		case 'E':
-			fmt.Println("PostgreSQL error:")
-			fmt.Println(parseError(payload))
-			return nil
+			return nullRows, dataRows, tableHeaderDescriptors, errors.New(parseError(payload))
 
 		case 'N':
 			// NoticeResponse.
@@ -554,22 +570,32 @@ const (
 )
 
 // printRowDescription parses a RowDescription message.
-func printRowDescription(payload []byte) {
+
+type tableRowDescription struct {
+	name                  string
+	tableOid              []byte
+	columnAttributeNumber []byte
+	dataTypeOid           []byte
+	dataTypeSize          []byte
+	typeModifier          []byte
+	formatCode            []byte
+}
+
+func parseRowDescription(payload []byte) []*tableRowDescription {
 
 	if len(payload) < 2 {
-		return
+		return []*tableRowDescription{}
 	}
 
 	count := int(binary.BigEndian.Uint16(payload[:2]))
 	pos := 2
 
-	fmt.Printf("Columns: %d\n", count)
-
+	tableRowDescriptors := []*tableRowDescription{}
 	for i := 0; i < count; i++ {
 
 		end := bytesIndexZero(payload[pos:])
 		if end < 0 {
-			return
+			break
 		}
 
 		name := string(payload[pos : pos+end])
@@ -577,64 +603,79 @@ func printRowDescription(payload []byte) {
 
 		// Table OID
 		if pos+18 > len(payload) {
-			return
+			break
 		}
 
-		pos += 4 // table OID
-		pos += 2 // column attribute number
-		pos += 4 // data type OID
-		pos += 2 // data type size
-		pos += 4 // type modifier
-		pos += 2 // format code
+		t := &tableRowDescription{
+			name: strings.TrimSpace(name),
+		}
 
-		fmt.Printf("  %s\n", name)
+		t.tableOid = payload[pos : pos+4]
+		pos += 4
+
+		t.columnAttributeNumber = payload[pos : pos+2]
+		pos += 2
+
+		t.dataTypeOid = payload[pos : pos+4]
+		pos += 4
+
+		t.dataTypeSize = payload[pos : pos+2]
+		pos += 2
+
+		t.typeModifier = payload[pos : pos+2]
+		pos += 4
+
+		t.formatCode = payload[pos : pos+2]
+		pos += 2
+
+		tableRowDescriptors = append(tableRowDescriptors, t)
 	}
+
+	return tableRowDescriptors
 }
 
-// printDataRow parses a DataRow message.
-func printDataRow(payload []byte) {
+// parseDataRow parses a DataRow message.
+func parseDataRow(payload []byte) ([]bool, []string) {
 
 	if len(payload) < 2 {
-		return
+		return []bool{}, []string{}
 	}
 
 	count := int(binary.BigEndian.Uint16(payload[:2]))
 	pos := 2
 
-	fmt.Print("Row: ")
+	rowData := []string{}
+	nullData := []bool{}
 
 	for i := 0; i < count; i++ {
 
 		if pos+4 > len(payload) {
-			return
+			break
 		}
 
 		length := int32(binary.BigEndian.Uint32(payload[pos : pos+4]))
 		pos += 4
 
 		if length == -1 {
-			fmt.Print("NULL")
-			if i != count-1 {
-				fmt.Print(" | ")
-			}
+			nullData = append(nullData, true)
+			rowData = append(rowData, "")
 			continue
 		}
 
+		nullData = append(nullData, false)
+
 		if pos+int(length) > len(payload) {
-			return
+			break
 		}
 
 		value := string(payload[pos : pos+int(length)])
+		rowData = append(rowData, value)
 		pos += int(length)
 
-		fmt.Print(value)
-
-		if i != count-1 {
-			fmt.Print(" | ")
-		}
 	}
 
-	fmt.Println()
+	return nullData, rowData
+
 }
 
 // parseError extracts PostgreSQL ErrorResponse/NoticeResponse fields.
