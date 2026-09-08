@@ -17,8 +17,9 @@ import (
 )
 
 type PGConnection struct {
-	conn   net.Conn
-	reader *bufio.Reader
+	conn    net.Conn
+	reader  *bufio.Reader
+	oid2typ map[int]string
 }
 
 func (p *PGConnection) Close() {
@@ -43,6 +44,23 @@ func NewConnection(host string, port int, database, username, password string) (
 	if err != nil {
 		return nil, err
 	}
+
+	_, data, _, _, err := p.Query("SELECT oid, typname FROM pg_type;")
+
+	if err != nil {
+		return nil, err
+	}
+
+	m := make(map[int]string)
+	for _, row := range data {
+		i, err := strconv.Atoi(row[0])
+		if err != nil {
+			continue
+		}
+		m[i] = row[1]
+	}
+
+	p.oid2typ = m
 
 	return p, nil
 
@@ -257,21 +275,15 @@ func (p *PGConnection) readMessage() (byte, []byte, error) {
 	return msgType, payload, nil
 }
 
-func (p *PGConnection) Query(query string) ([][]bool, [][]string, []string, error) {
+func (p *PGConnection) Query(query string) (nulls [][]bool, data [][]string, columns []string, types []string, err error) {
 
-	err := p.sendQuery(query)
+	err = p.sendQuery(query)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
-	nulls, data, headers, err := p.readResults()
-
-	columns := make([]string, len(headers))
-	for _, h := range headers {
-		columns = append(columns, h.name)
-	}
-
-	return nulls, data, columns, err
+	nulls, data, columns, types, err = p.readResults()
+	return nulls, data, columns, types, err
 
 }
 
@@ -515,22 +527,29 @@ func parseSCRAMAttributes(s string) map[string]string {
 }
 
 // readResults consumes PostgreSQL messages resulting from the query.
-func (p *PGConnection) readResults() ([][]bool, [][]string, []*tableRowDescription, error) {
+func (p *PGConnection) readResults() (nullRows [][]bool, dataRows [][]string, columns []string, types []string, err error) {
 
-	tableHeaderDescriptors := []*tableRowDescription{}
-	dataRows := [][]string{}
-	nullRows := [][]bool{}
 	for {
 		msgType, payload, err := p.readMessage()
 		if err != nil {
-			return nullRows, dataRows, tableHeaderDescriptors, err
+			return nullRows, dataRows, columns, []string{}, err
 		}
 
 		switch msgType {
 
 		case 'T':
 			// RowDescription.
-			tableHeaderDescriptors = parseRowDescription(payload)
+			tableHeaderDescriptors := parseRowDescription(payload)
+			for _, t := range tableHeaderDescriptors {
+				oid := t.dataTypeOid
+				val := int(binary.BigEndian.Uint32(oid))
+				typ, ok := p.oid2typ[val]
+				if !ok {
+					typ = "<unknown>"
+				}
+				types = append(types, typ)
+				columns = append(columns, t.name)
+			}
 
 		case 'D':
 			// DataRow.
@@ -543,10 +562,10 @@ func (p *PGConnection) readResults() ([][]bool, [][]string, []*tableRowDescripti
 
 		case 'Z':
 			// ReadyForQuery.
-			return nullRows, dataRows, tableHeaderDescriptors, nil
+			return nullRows, dataRows, columns, types, nil
 
 		case 'E':
-			return nullRows, dataRows, tableHeaderDescriptors, errors.New(parseError(payload))
+			return nullRows, dataRows, columns, types, errors.New(parseError(payload))
 
 		case 'N':
 			// NoticeResponse.
