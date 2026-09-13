@@ -11,9 +11,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
+	"reflect"
+	"slices"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 type PGConnection struct {
@@ -296,6 +301,269 @@ func (p *PGConnection) Execute(query string, output any) error {
 
 	return UnmarshalStrings(columns, nulls, data, output)
 
+}
+
+func getNamedParams(query string) []string {
+
+	params := []string{}
+
+	isNamed := false
+
+	buff := []rune{}
+	for _, letter := range query {
+		if letter == ':' {
+			isNamed = true
+			continue
+		}
+
+		if unicode.IsSpace(letter) && isNamed {
+			s := string(buff)
+			if !slices.Contains(params, s) {
+				params = append(params, string(buff))
+			}
+			buff = []rune{}
+			isNamed = false
+			continue
+		}
+
+		if isNamed {
+			buff = append(buff, letter)
+		}
+	}
+
+	if len(buff) > 0 {
+		params = append(params, string(buff))
+	}
+
+	return params
+
+}
+
+// EscapeInternal is a Go equivalent of PostgreSQL/libpq's
+// PQescapeInternal for UTF-8 strings.
+//
+// If asIdent is false:
+//   - escapes ' as ”
+//   - escapes \ as \\
+//   - uses E'...' syntax when a backslash is present
+//
+// If asIdent is true:
+//   - escapes " as ""
+//   - does not treat backslash specially
+//
+// The returned string is suitable for embedding into SQL syntax.
+// For values, PostgreSQL parameters ($1, $2, ...) are preferable.
+func EscapeInternal(s string, asIdent bool) (string, error) {
+	// PostgreSQL's C function validates multibyte input.
+	// Go strings can contain arbitrary bytes, so explicitly reject
+	// invalid UTF-8.
+	if !utf8.ValidString(s) {
+		return "", errors.New("invalid multibyte character")
+	}
+
+	quoteChar := byte('\'')
+	if asIdent {
+		quoteChar = '"'
+	}
+
+	var numQuotes int
+	var numBackslashes int
+
+	// First pass: determine how much the output will expand.
+	for i := 0; i < len(s); {
+		c := s[i]
+
+		if c == quoteChar {
+			numQuotes++
+		} else if c == '\\' {
+			numBackslashes++
+		}
+
+		// Advance over the UTF-8 character.
+		if c < utf8.RuneSelf {
+			i++
+		} else {
+			_, size := utf8.DecodeRuneInString(s[i:])
+			i += size
+		}
+	}
+
+	// Match the size calculation performed by libpq.
+	//
+	// input length
+	// + escaped quotes
+	// + 2 quote characters
+	// + terminating NUL
+	//
+	// Go strings don't require the terminating NUL, but we still
+	// perform overflow checks before allocating.
+	resultSize := len(s)
+
+	if numQuotes > math.MaxInt-resultSize {
+		return "", errors.New("escaped string size exceeds maximum allowed")
+	}
+	resultSize += numQuotes
+
+	if resultSize > math.MaxInt-3 {
+		return "", errors.New("escaped string size exceeds maximum allowed")
+	}
+	resultSize += 3
+
+	// For literals containing backslashes, libpq adds:
+	//
+	//     " E"
+	//
+	// before the opening quote, and duplicates every backslash.
+	if !asIdent && numBackslashes > 0 {
+		if numBackslashes > math.MaxInt-resultSize {
+			return "", errors.New("escaped string size exceeds maximum allowed")
+		}
+		resultSize += numBackslashes
+
+		if resultSize > math.MaxInt-2 {
+			return "", errors.New("escaped string size exceeds maximum allowed")
+		}
+		resultSize += 2
+	}
+
+	// Build the result.
+	var b strings.Builder
+	b.Grow(resultSize)
+
+	// PostgreSQL escape-string syntax.
+	if !asIdent && numBackslashes > 0 {
+		// libpq intentionally puts a leading space here.
+		b.WriteString(" E")
+	}
+
+	// Opening quote.
+	b.WriteByte(quoteChar)
+
+	// Fast path: nothing needs escaping.
+	if numQuotes == 0 && (numBackslashes == 0 || asIdent) {
+		b.WriteString(s)
+	} else {
+		// Slow path.
+		for i := 0; i < len(s); {
+			c := s[i]
+
+			if c == quoteChar {
+				// SQL escaping:
+				//
+				// ' -> ''
+				// " -> ""
+				b.WriteByte(c)
+				b.WriteByte(c)
+				i++
+				continue
+			}
+
+			if !asIdent && c == '\\' {
+				// PostgreSQL escape string:
+				//
+				// \ -> \\
+				b.WriteByte('\\')
+				b.WriteByte('\\')
+				i++
+				continue
+			}
+
+			// Copy UTF-8 character unchanged.
+			if c < utf8.RuneSelf {
+				b.WriteByte(c)
+				i++
+			} else {
+				_, size := utf8.DecodeRuneInString(s[i:])
+				b.WriteString(s[i : i+size])
+				i += size
+			}
+		}
+	}
+
+	// Closing quote.
+	b.WriteByte(quoteChar)
+
+	return b.String(), nil
+}
+
+// func (p *PGConnection) ExecuteMany(query string, input []any) error {
+
+// 	if len(input) == 0 {
+// 		return nil
+// 	}
+
+// 	_, _, _, _, err := p.Query("BEGIN")
+
+// 	if err != nil {
+// 		_, _, _, _, err2 := p.Query("ROLLBACK")
+// 		if err2 != nil {
+// 			return err2
+// 		}
+// 		return err
+// 	}
+
+// 	objects := []map[string]any{}
+// 	for _, obj := range input {
+// 		o, err := structToPGQLMap(obj)
+// 		if err != nil {
+// 			goto done
+// 		}
+// 		objects = append(objects, o)
+// 	}
+
+// 	_, _, _, _, err = p.Query("COMMIT")
+
+// 	if err != nil {
+// 		goto done
+// 	}
+
+// 	return nil
+
+// done:
+
+// 	return err
+
+// }
+
+func structToPGQLMap(src any) (map[string]any, error) {
+
+	rv := reflect.ValueOf(src)
+
+	// Dereference pointer.
+	if rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return nil, fmt.Errorf("source is nil")
+		}
+		rv = rv.Elem()
+	}
+
+	if rv.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("source must be a struct")
+	}
+
+	rt := rv.Type()
+	result := make(map[string]any)
+
+	for i := 0; i < rt.NumField(); i++ {
+		fieldType := rt.Field(i)
+		fieldValue := rv.Field(i)
+
+		tag := fieldType.Tag.Get("pgql")
+
+		// Ignore fields without a pgql tag.
+		if tag == "" || tag == "-" {
+			continue
+		}
+
+		// Only access exported fields.
+		if !fieldValue.CanInterface() {
+			continue
+		}
+
+		result[tag] = fieldValue.Interface()
+	}
+
+	return result, nil
 }
 
 // sendQuery sends PostgreSQL's Simple Query message.
@@ -837,4 +1105,316 @@ func bytesIndexZero(b []byte) int {
 	}
 
 	return -1
+}
+
+func (p *PGConnection) ExecPrepared(
+	name string,
+	query string,
+	args ...any,
+) error {
+
+	// ---------------------------------------------------------
+	// Parse
+	// ---------------------------------------------------------
+	//
+	// Parse message:
+	//
+	// 'P'
+	// Int32 length
+	// statement name + '\0'
+	// query + '\0'
+	// Int16 number of parameter type OIDs
+	// parameter type OIDs
+	//
+	// Using zero OIDs tells PostgreSQL to infer the parameter
+	// types from the SQL statement.
+	//
+	if err := p.sendParse(name, query, len(args)); err != nil {
+		return err
+	}
+
+	// ---------------------------------------------------------
+	// Bind
+	// ---------------------------------------------------------
+	if err := p.sendBind(name, args); err != nil {
+		return err
+	}
+
+	// ---------------------------------------------------------
+	// Execute
+	// ---------------------------------------------------------
+	if err := p.sendExecute(); err != nil {
+		return err
+	}
+
+	// ---------------------------------------------------------
+	// Sync
+	// ---------------------------------------------------------
+	//
+	// Sync tells PostgreSQL to finish this extended-query
+	// cycle and return ReadyForQuery.
+	//
+	if err := p.sendMessage('S', nil); err != nil {
+		return err
+	}
+
+	// ---------------------------------------------------------
+	// Read responses
+	// ---------------------------------------------------------
+	return p.readExecResults()
+}
+
+func (p *PGConnection) sendExecute() error {
+
+	payload := make([]byte, 0)
+
+	// Portal name.
+	// Empty = unnamed portal.
+	payload = append(payload, 0)
+
+	// Maximum number of rows.
+	//
+	// 0 means "no limit".
+	payload = appendInt32(payload, 0)
+
+	return p.sendMessage('E', payload)
+}
+
+func (p *PGConnection) readExecResults() error {
+
+	for {
+		msgType, payload, err := p.readMessage()
+		if err != nil {
+			return err
+		}
+
+		switch msgType {
+
+		case '1':
+			// ParseComplete.
+			continue
+
+		case '2':
+			// BindComplete.
+			continue
+
+		case 'C':
+			// CommandComplete.
+			//
+			// Examples:
+			//
+			// INSERT 0 1
+			// UPDATE 1
+			//
+			// The payload is a NUL-terminated command tag.
+			continue
+
+		case 'Z':
+			// ReadyForQuery.
+			return nil
+
+		case 'E':
+			return errors.New(parseError(payload))
+
+		case 'N':
+			// NoticeResponse.
+			fmt.Printf(
+				"Notice: %s\n",
+				parseError(payload),
+			)
+
+		default:
+			return fmt.Errorf(
+				"unexpected PostgreSQL message %q",
+				msgType,
+			)
+		}
+	}
+}
+
+func (p *PGConnection) sendParse(
+	name string,
+	query string,
+	numParams int,
+) error {
+
+	payload := make([]byte, 0)
+
+	// Prepared statement name.
+	payload = append(payload, []byte(name)...)
+	payload = append(payload, 0)
+
+	// SQL query.
+	payload = append(payload, []byte(query)...)
+	payload = append(payload, 0)
+
+	// Number of parameter type OIDs.
+	payload = appendInt16(payload, int16(numParams))
+
+	// Zero means PostgreSQL should infer the parameter type.
+	for i := 0; i < numParams; i++ {
+		payload = appendInt32(payload, 0)
+	}
+
+	return p.sendMessage('P', payload)
+}
+
+func appendInt16(dst []byte, value int16) []byte {
+	var b [2]byte
+
+	binary.BigEndian.PutUint16(
+		b[:],
+		uint16(value),
+	)
+
+	return append(dst, b[:]...)
+}
+
+func (p *PGConnection) sendBind(
+	statementName string,
+	args []any,
+) error {
+
+	payload := make([]byte, 0)
+
+	// ---------------------------------------------------------
+	// Portal name
+	// ---------------------------------------------------------
+	//
+	// Empty portal name means the unnamed portal.
+	//
+	payload = append(payload, 0)
+
+	// ---------------------------------------------------------
+	// Prepared statement name
+	// ---------------------------------------------------------
+	payload = append(payload, []byte(statementName)...)
+	payload = append(payload, 0)
+
+	// ---------------------------------------------------------
+	// Parameter format codes
+	// ---------------------------------------------------------
+	//
+	// 0 = text
+	// 1 = binary
+	//
+	// We use text for all parameters.
+	//
+	payload = appendInt16(payload, int16(len(args)))
+
+	for range args {
+		payload = appendInt16(payload, 0)
+	}
+
+	// ---------------------------------------------------------
+	// Parameter values
+	// ---------------------------------------------------------
+	payload = appendInt16(payload, int16(len(args)))
+
+	for _, arg := range args {
+
+		if arg == nil {
+			// -1 means SQL NULL.
+			payload = appendInt32(payload, -1)
+			continue
+		}
+
+		value, err := parameterString(arg)
+		if err != nil {
+			return err
+		}
+
+		payload = appendInt32(
+			payload,
+			int32(len(value)),
+		)
+
+		payload = append(
+			payload,
+			[]byte(value)...,
+		)
+	}
+
+	// ---------------------------------------------------------
+	// Result format codes
+	// ---------------------------------------------------------
+	//
+	// Zero result formats means text format by default.
+	//
+	payload = appendInt16(payload, 0)
+
+	return p.sendMessage('B', payload)
+}
+
+func parameterString(value any) (string, error) {
+
+	switch v := value.(type) {
+
+	case string:
+		return v, nil
+
+	case []byte:
+		return string(v), nil
+
+	case bool:
+		if v {
+			return "true", nil
+		}
+		return "false", nil
+
+	case int:
+		return strconv.Itoa(v), nil
+
+	case int8:
+		return strconv.FormatInt(int64(v), 10), nil
+
+	case int16:
+		return strconv.FormatInt(int64(v), 10), nil
+
+	case int32:
+		return strconv.FormatInt(int64(v), 10), nil
+
+	case int64:
+		return strconv.FormatInt(v, 10), nil
+
+	case uint:
+		return strconv.FormatUint(uint64(v), 10), nil
+
+	case uint8:
+		return strconv.FormatUint(uint64(v), 10), nil
+
+	case uint16:
+		return strconv.FormatUint(uint64(v), 10), nil
+
+	case uint32:
+		return strconv.FormatUint(uint64(v), 10), nil
+
+	case uint64:
+		return strconv.FormatUint(v, 10), nil
+
+	case float32:
+		return strconv.FormatFloat(
+			float64(v),
+			'g',
+			-1,
+			32,
+		), nil
+
+	case float64:
+		return strconv.FormatFloat(
+			v,
+			'g',
+			-1,
+			64,
+		), nil
+
+	case fmt.Stringer:
+		return v.String(), nil
+
+	default:
+		return "", fmt.Errorf(
+			"unsupported PostgreSQL parameter type %T",
+			value,
+		)
+	}
 }
