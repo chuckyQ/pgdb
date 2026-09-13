@@ -24,7 +24,7 @@ const tagName = "pgql"
 //	}
 //
 // If no pgql tag is present, the Go field name is used.
-func UnmarshalStrings(fields []string, values [][]string, dst any) error {
+func UnmarshalStrings(columns []string, nulls [][]bool, values [][]string, dst any) error {
 	if dst == nil {
 		return fmt.Errorf("destination cannot be nil")
 	}
@@ -47,14 +47,14 @@ func UnmarshalStrings(fields []string, values [][]string, dst any) error {
 			return nil
 		}
 
-		if err := unmarshalStruct(fields, values[0], elem); err != nil {
+		if err := unmarshalStruct(columns, values[0], nulls[0], elem); err != nil {
 			return err
 		}
 
 		return nil
 
 	case reflect.Slice:
-		return unmarshalSlice(fields, values, elem)
+		return unmarshalSlice(columns, nulls, values, elem)
 
 	default:
 		return fmt.Errorf(
@@ -65,6 +65,7 @@ func UnmarshalStrings(fields []string, values [][]string, dst any) error {
 
 func unmarshalSlice(
 	fields []string,
+	nulls [][]bool,
 	values [][]string,
 	dst reflect.Value,
 ) error {
@@ -82,6 +83,7 @@ func unmarshalSlice(
 			if err := unmarshalStruct(
 				fields,
 				row,
+				nulls[i],
 				result.Index(i),
 			); err != nil {
 				return fmt.Errorf("row %d: %w", i, err)
@@ -108,6 +110,7 @@ func unmarshalSlice(
 			if err := unmarshalStruct(
 				fields,
 				row,
+				nulls[i],
 				structValue.Elem(),
 			); err != nil {
 				return fmt.Errorf("row %d: %w", i, err)
@@ -128,6 +131,7 @@ func unmarshalSlice(
 func unmarshalStruct(
 	fields []string,
 	values []string,
+	nulls []bool,
 	dst reflect.Value,
 ) error {
 	if dst.Kind() != reflect.Struct {
@@ -192,7 +196,7 @@ func unmarshalStruct(
 			continue
 		}
 
-		if err := setStringValue(field, values[i]); err != nil {
+		if err := setStringValue(field, nulls[i], values[i]); err != nil {
 			return fmt.Errorf(
 				"field %q: %w",
 				columnName,
@@ -206,9 +210,24 @@ func unmarshalStruct(
 
 func setStringValue(
 	field reflect.Value,
+	null bool,
 	value string,
 ) error {
+
+	if field.Kind() == reflect.Pointer && null {
+		field.Set(reflect.Zero(field.Type()))
+		return nil
+	}
+
 	switch field.Kind() {
+
+	case reflect.Pointer:
+
+		if field.IsNil() {
+			field.Set(reflect.New(field.Type().Elem()))
+		}
+
+		return setStringValue(field.Elem(), false, value)
 
 	case reflect.String:
 		field.SetString(value)
