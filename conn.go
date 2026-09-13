@@ -287,6 +287,17 @@ func (p *PGConnection) Query(query string) (nulls [][]bool, data [][]string, col
 
 }
 
+func (p *PGConnection) Execute(query string, output any) error {
+
+	nulls, data, columns, _, err := p.Query(query)
+	if err != nil {
+		return err
+	}
+
+	return UnmarshalStrings(columns, nulls, data, output)
+
+}
+
 // sendQuery sends PostgreSQL's Simple Query message.
 //
 // Message layout:
