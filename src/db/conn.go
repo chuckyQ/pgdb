@@ -11,14 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"unicode"
-	"unicode/utf8"
 )
 
 type PGConnection struct {
@@ -316,7 +314,7 @@ func getNamedParams(query string) []string {
 			continue
 		}
 
-		if unicode.IsSpace(letter) && isNamed {
+		if !(unicode.IsLetter(letter) || unicode.IsNumber(letter)) && isNamed {
 			s := string(buff)
 			if !slices.Contains(params, s) {
 				params = append(params, string(buff))
@@ -339,191 +337,90 @@ func getNamedParams(query string) []string {
 
 }
 
-// EscapeInternal is a Go equivalent of PostgreSQL/libpq's
-// PQescapeInternal for UTF-8 strings.
-//
-// If asIdent is false:
-//   - escapes ' as ”
-//   - escapes \ as \\
-//   - uses E'...' syntax when a backslash is present
-//
-// If asIdent is true:
-//   - escapes " as ""
-//   - does not treat backslash specially
-//
-// The returned string is suitable for embedding into SQL syntax.
-// For values, PostgreSQL parameters ($1, $2, ...) are preferable.
-func EscapeInternal(s string, asIdent bool) (string, error) {
-	// PostgreSQL's C function validates multibyte input.
-	// Go strings can contain arbitrary bytes, so explicitly reject
-	// invalid UTF-8.
-	if !utf8.ValidString(s) {
-		return "", errors.New("invalid multibyte character")
+func (p *PGConnection) ExecuteMany(name, query string, input any) error {
+
+	rv := reflect.ValueOf(input)
+	if !rv.IsValid() {
+		return errors.New("nil value")
 	}
 
-	quoteChar := byte('\'')
-	if asIdent {
-		quoteChar = '"'
+	// Dereference pointers/interfaces.
+	for rv.Kind() == reflect.Pointer || rv.Kind() == reflect.Interface {
+		if rv.IsNil() {
+			return errors.New("nil value")
+		}
+		rv = rv.Elem()
 	}
 
-	var numQuotes int
-	var numBackslashes int
+	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
+		return fmt.Errorf("expected slice or array, got %s", rv.Kind())
+	}
 
-	// First pass: determine how much the output will expand.
-	for i := 0; i < len(s); {
-		c := s[i]
+	namedParams := getNamedParams(query)
 
-		if c == quoteChar {
-			numQuotes++
-		} else if c == '\\' {
-			numBackslashes++
+	for i, param := range namedParams {
+		query = strings.ReplaceAll(query, ":"+param, "$"+strconv.Itoa(i+1))
+	}
+
+	fmt.Println(query)
+
+	fmt.Println(namedParams)
+
+	_, _, _, _, err := p.Query("BEGIN")
+	if err != nil {
+		return err
+	}
+	for i := range rv.Len() {
+		objects := []any{}
+
+		obj := rv.Index(i)
+		fmt.Println(obj)
+		o, err := structToPGQLMap(obj)
+		if err != nil {
+			fmt.Println("failed mapping")
+			goto failed
 		}
 
-		// Advance over the UTF-8 character.
-		if c < utf8.RuneSelf {
-			i++
-		} else {
-			_, size := utf8.DecodeRuneInString(s[i:])
-			i += size
-		}
-	}
+		fmt.Println("****", o)
 
-	// Match the size calculation performed by libpq.
-	//
-	// input length
-	// + escaped quotes
-	// + 2 quote characters
-	// + terminating NUL
-	//
-	// Go strings don't require the terminating NUL, but we still
-	// perform overflow checks before allocating.
-	resultSize := len(s)
-
-	if numQuotes > math.MaxInt-resultSize {
-		return "", errors.New("escaped string size exceeds maximum allowed")
-	}
-	resultSize += numQuotes
-
-	if resultSize > math.MaxInt-3 {
-		return "", errors.New("escaped string size exceeds maximum allowed")
-	}
-	resultSize += 3
-
-	// For literals containing backslashes, libpq adds:
-	//
-	//     " E"
-	//
-	// before the opening quote, and duplicates every backslash.
-	if !asIdent && numBackslashes > 0 {
-		if numBackslashes > math.MaxInt-resultSize {
-			return "", errors.New("escaped string size exceeds maximum allowed")
-		}
-		resultSize += numBackslashes
-
-		if resultSize > math.MaxInt-2 {
-			return "", errors.New("escaped string size exceeds maximum allowed")
-		}
-		resultSize += 2
-	}
-
-	// Build the result.
-	var b strings.Builder
-	b.Grow(resultSize)
-
-	// PostgreSQL escape-string syntax.
-	if !asIdent && numBackslashes > 0 {
-		// libpq intentionally puts a leading space here.
-		b.WriteString(" E")
-	}
-
-	// Opening quote.
-	b.WriteByte(quoteChar)
-
-	// Fast path: nothing needs escaping.
-	if numQuotes == 0 && (numBackslashes == 0 || asIdent) {
-		b.WriteString(s)
-	} else {
-		// Slow path.
-		for i := 0; i < len(s); {
-			c := s[i]
-
-			if c == quoteChar {
-				// SQL escaping:
-				//
-				// ' -> ''
-				// " -> ""
-				b.WriteByte(c)
-				b.WriteByte(c)
-				i++
+		for i, each := range namedParams {
+			value, exists := o[namedParams[i]]
+			fmt.Println(each, exists)
+			if !exists {
+				// Should this be an error?
 				continue
 			}
+			objects = append(objects, value)
+		}
 
-			if !asIdent && c == '\\' {
-				// PostgreSQL escape string:
-				//
-				// \ -> \\
-				b.WriteByte('\\')
-				b.WriteByte('\\')
-				i++
-				continue
-			}
-
-			// Copy UTF-8 character unchanged.
-			if c < utf8.RuneSelf {
-				b.WriteByte(c)
-				i++
-			} else {
-				_, size := utf8.DecodeRuneInString(s[i:])
-				b.WriteString(s[i : i+size])
-				i += size
-			}
+		err = p.ExecPrepared(name, query, objects...)
+		if err != nil {
+			fmt.Println(err.Error())
+			goto failed
 		}
 	}
 
-	// Closing quote.
-	b.WriteByte(quoteChar)
+	_, _, _, _, err = p.Query("COMMIT")
 
-	return b.String(), nil
+	if err != nil {
+		goto failed
+	}
+
+	fmt.Println("CHANGES COMMITTED")
+
+	return nil
+
+failed:
+
+	_, _, _, _, err2 := p.Query("ROLLBACK")
+
+	if err != nil {
+		return err
+	}
+
+	return err2
+
 }
-
-// func (p *PGConnection) ExecuteMany(query string, input []any) error {
-
-// 	if len(input) == 0 {
-// 		return nil
-// 	}
-
-// 	_, _, _, _, err := p.Query("BEGIN")
-
-// 	if err != nil {
-// 		_, _, _, _, err2 := p.Query("ROLLBACK")
-// 		if err2 != nil {
-// 			return err2
-// 		}
-// 		return err
-// 	}
-
-// 	objects := []map[string]any{}
-// 	for _, obj := range input {
-// 		o, err := structToPGQLMap(obj)
-// 		if err != nil {
-// 			goto done
-// 		}
-// 		objects = append(objects, o)
-// 	}
-
-// 	_, _, _, _, err = p.Query("COMMIT")
-
-// 	if err != nil {
-// 		goto done
-// 	}
-
-// 	return nil
-
-// done:
-
-// 	return err
-
-// }
 
 func structToPGQLMap(src any) (map[string]any, error) {
 
@@ -550,6 +447,8 @@ func structToPGQLMap(src any) (map[string]any, error) {
 
 		tag := fieldType.Tag.Get("pgql")
 
+		fmt.Println(fieldType.Tag)
+
 		// Ignore fields without a pgql tag.
 		if tag == "" || tag == "-" {
 			continue
@@ -559,7 +458,7 @@ func structToPGQLMap(src any) (map[string]any, error) {
 		if !fieldValue.CanInterface() {
 			continue
 		}
-
+		fmt.Println("tag is", tag)
 		result[tag] = fieldValue.Interface()
 	}
 
