@@ -1,4 +1,4 @@
-package main
+package db
 
 import (
 	"bufio"
@@ -12,17 +12,15 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"reflect"
-	"slices"
 	"strconv"
 	"strings"
-	"unicode"
 )
 
 type PGConnection struct {
-	conn    net.Conn
-	reader  *bufio.Reader
-	oid2typ map[int]string
+	conn          net.Conn
+	reader        *bufio.Reader
+	oid2typ       map[int]string
+	preparedStmts map[string]string
 }
 
 func (p *PGConnection) Close() {
@@ -31,7 +29,7 @@ func (p *PGConnection) Close() {
 	}
 }
 
-func NewConnection(host string, port int, database, username, password string) (*PGConnection, error) {
+func Connect(host string, port int, database, username, password string) (*PGConnection, error) {
 
 	conn, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 
@@ -39,8 +37,9 @@ func NewConnection(host string, port int, database, username, password string) (
 		return nil, err
 	}
 	p := &PGConnection{
-		conn:   conn,
-		reader: bufio.NewReader(conn),
+		conn:          conn,
+		reader:        bufio.NewReader(conn),
+		preparedStmts: make(map[string]string),
 	}
 
 	err = p.startup(database, username, password)
@@ -290,179 +289,14 @@ func (p *PGConnection) Query(query string) (nulls [][]bool, data [][]string, col
 
 }
 
-func (p *PGConnection) Execute(query string, output any) error {
+func (p *PGConnection) Exec(query string, args ...any) (nulls [][]bool, data [][]string, columns []string, types []string, err error) {
 
-	nulls, data, columns, _, err := p.Query(query)
-	if err != nil {
-		return err
+	if len(args) == 1 {
+		return p.Query(query)
 	}
 
-	return UnmarshalStrings(columns, nulls, data, output)
+	return p.ExecPrepared(query, args...)
 
-}
-
-func getNamedParams(query string) []string {
-
-	params := []string{}
-
-	isNamed := false
-
-	buff := []rune{}
-	for _, letter := range query {
-		if letter == ':' {
-			isNamed = true
-			continue
-		}
-
-		if !(unicode.IsLetter(letter) || unicode.IsNumber(letter)) && isNamed {
-			s := string(buff)
-			if !slices.Contains(params, s) {
-				params = append(params, string(buff))
-			}
-			buff = []rune{}
-			isNamed = false
-			continue
-		}
-
-		if isNamed {
-			buff = append(buff, letter)
-		}
-	}
-
-	if len(buff) > 0 {
-		params = append(params, string(buff))
-	}
-
-	return params
-
-}
-
-func (p *PGConnection) ExecuteMany(name, query string, input any) error {
-
-	rv := reflect.ValueOf(input)
-	if !rv.IsValid() {
-		return errors.New("nil value")
-	}
-
-	// Dereference pointers/interfaces.
-	for rv.Kind() == reflect.Pointer || rv.Kind() == reflect.Interface {
-		if rv.IsNil() {
-			return errors.New("nil value")
-		}
-		rv = rv.Elem()
-	}
-
-	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
-		return fmt.Errorf("expected slice or array, got %s", rv.Kind())
-	}
-
-	namedParams := getNamedParams(query)
-
-	for i, param := range namedParams {
-		query = strings.ReplaceAll(query, ":"+param, "$"+strconv.Itoa(i+1))
-	}
-
-	fmt.Println(query)
-
-	fmt.Println(namedParams)
-
-	_, _, _, _, err := p.Query("BEGIN")
-	if err != nil {
-		return err
-	}
-	for i := range rv.Len() {
-		objects := []any{}
-
-		obj := rv.Index(i)
-		fmt.Println(obj)
-		o, err := structToPGQLMap(obj)
-		if err != nil {
-			fmt.Println("failed mapping")
-			goto failed
-		}
-
-		fmt.Println("****", o)
-
-		for i, each := range namedParams {
-			value, exists := o[namedParams[i]]
-			fmt.Println(each, exists)
-			if !exists {
-				// Should this be an error?
-				continue
-			}
-			objects = append(objects, value)
-		}
-
-		err = p.ExecPrepared(name, query, objects...)
-		if err != nil {
-			fmt.Println(err.Error())
-			goto failed
-		}
-	}
-
-	_, _, _, _, err = p.Query("COMMIT")
-
-	if err != nil {
-		goto failed
-	}
-
-	fmt.Println("CHANGES COMMITTED")
-
-	return nil
-
-failed:
-
-	_, _, _, _, err2 := p.Query("ROLLBACK")
-
-	if err != nil {
-		return err
-	}
-
-	return err2
-
-}
-
-func structToPGQLMap(src any) (map[string]any, error) {
-
-	rv := reflect.ValueOf(src)
-
-	// Dereference pointer.
-	if rv.Kind() == reflect.Pointer {
-		if rv.IsNil() {
-			return nil, fmt.Errorf("source is nil")
-		}
-		rv = rv.Elem()
-	}
-
-	if rv.Kind() != reflect.Struct {
-		return nil, fmt.Errorf("source must be a struct")
-	}
-
-	rt := rv.Type()
-	result := make(map[string]any)
-
-	for i := 0; i < rt.NumField(); i++ {
-		fieldType := rt.Field(i)
-		fieldValue := rv.Field(i)
-
-		tag := fieldType.Tag.Get("pgql")
-
-		fmt.Println(fieldType.Tag)
-
-		// Ignore fields without a pgql tag.
-		if tag == "" || tag == "-" {
-			continue
-		}
-
-		// Only access exported fields.
-		if !fieldValue.CanInterface() {
-			continue
-		}
-		fmt.Println("tag is", tag)
-		result[tag] = fieldValue.Interface()
-	}
-
-	return result, nil
 }
 
 // sendQuery sends PostgreSQL's Simple Query message.
@@ -710,7 +544,7 @@ func (p *PGConnection) readResults() (nullRows [][]bool, dataRows [][]string, co
 	for {
 		msgType, payload, err := p.readMessage()
 		if err != nil {
-			return nullRows, dataRows, columns, []string{}, err
+			return nullRows, dataRows, columns, types, err
 		}
 
 		switch msgType {
@@ -1006,11 +840,13 @@ func bytesIndexZero(b []byte) int {
 	return -1
 }
 
-func (p *PGConnection) ExecPrepared(
-	name string,
-	query string,
-	args ...any,
-) error {
+func (p *PGConnection) ExecPrepared(query string, args ...any,
+) (nullRows [][]bool, dataRows [][]string, columns []string, types []string, err error) {
+
+	name, ok := p.preparedStmts[query]
+	if !ok {
+
+	}
 
 	// ---------------------------------------------------------
 	// Parse
@@ -1029,21 +865,21 @@ func (p *PGConnection) ExecPrepared(
 	// types from the SQL statement.
 	//
 	if err := p.sendParse(name, query, len(args)); err != nil {
-		return err
+		return nil, nil, nil, nil, err
 	}
 
 	// ---------------------------------------------------------
 	// Bind
 	// ---------------------------------------------------------
 	if err := p.sendBind(name, args); err != nil {
-		return err
+		return nil, nil, nil, nil, err
 	}
 
 	// ---------------------------------------------------------
 	// Execute
 	// ---------------------------------------------------------
 	if err := p.sendExecute(); err != nil {
-		return err
+		return nil, nil, nil, nil, err
 	}
 
 	// ---------------------------------------------------------
@@ -1054,7 +890,7 @@ func (p *PGConnection) ExecPrepared(
 	// cycle and return ReadyForQuery.
 	//
 	if err := p.sendMessage('S', nil); err != nil {
-		return err
+		return nil, nil, nil, nil, err
 	}
 
 	// ---------------------------------------------------------
@@ -1079,54 +915,77 @@ func (p *PGConnection) sendExecute() error {
 	return p.sendMessage('E', payload)
 }
 
-func (p *PGConnection) readExecResults() error {
-
+func (p *PGConnection) readExecResults() (
+	nullRows [][]bool,
+	dataRows [][]string,
+	columns []string,
+	types []string,
+	err error,
+) {
 	for {
 		msgType, payload, err := p.readMessage()
 		if err != nil {
-			return err
+			return nullRows, dataRows, columns, types, err
 		}
 
 		switch msgType {
 
 		case '1':
 			// ParseComplete.
-			continue
 
 		case '2':
 			// BindComplete.
-			continue
+
+		case 'T':
+			// RowDescription.
+
+			tableHeaderDescriptors := parseRowDescription(payload)
+
+			for _, descriptor := range tableHeaderDescriptors {
+				oid := descriptor.dataTypeOid
+				val := int(binary.BigEndian.Uint32(oid))
+
+				typ, ok := p.oid2typ[val]
+				if !ok {
+					typ = "<unknown>"
+				}
+
+				types = append(types, typ)
+				columns = append(columns, descriptor.name)
+			}
+
+		case 'D':
+			// DataRow.
+
+			nullRow, dataRow := parseDataRow(payload)
+
+			nullRows = append(nullRows, nullRow)
+			dataRows = append(dataRows, dataRow)
 
 		case 'C':
 			// CommandComplete.
 			//
-			// Examples:
-			//
-			// INSERT 0 1
-			// UPDATE 1
-			//
-			// The payload is a NUL-terminated command tag.
-			continue
-
-		case 'Z':
-			// ReadyForQuery.
-			return nil
+			// For INSERT/UPDATE/DELETE there may be no
+			// RowDescription/DataRow messages.
 
 		case 'E':
-			return errors.New(parseError(payload))
+			return nullRows, dataRows, columns, types,
+				errors.New(parseError(payload))
 
 		case 'N':
 			// NoticeResponse.
-			fmt.Printf(
-				"Notice: %s\n",
-				parseError(payload),
-			)
+			fmt.Printf("Notice: %s\n", parseError(payload))
+
+		case 'Z':
+			// ReadyForQuery.
+			return nullRows, dataRows, columns, types, nil
 
 		default:
-			return fmt.Errorf(
-				"unexpected PostgreSQL message %q",
-				msgType,
-			)
+			return nullRows, dataRows, columns, types,
+				fmt.Errorf(
+					"unexpected PostgreSQL message %q",
+					msgType,
+				)
 		}
 	}
 }
