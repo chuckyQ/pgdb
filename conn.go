@@ -291,7 +291,7 @@ func (p *PGConnection) Query(query string) (nulls [][]bool, data [][]string, col
 
 func (p *PGConnection) Exec(query string, args ...any) (nulls [][]bool, data [][]string, columns []string, types []string, err error) {
 
-	if len(args) == 1 {
+	if len(args) == 0 {
 		return p.Query(query)
 	}
 
