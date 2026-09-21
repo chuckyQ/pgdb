@@ -1,4 +1,4 @@
-package db
+package pgdb
 
 import (
 	"bufio"
@@ -791,10 +791,7 @@ func pbkdf2SHA256(
 	return result[:keyLength]
 }
 
-func hmacSHA256(
-	key []byte,
-	data []byte,
-) []byte {
+func hmacSHA256(key []byte, data []byte) []byte {
 
 	h := hmac.New(
 		sha256.New,
@@ -814,10 +811,7 @@ func md5Hash(data []byte) [16]byte {
 	panic("replace md5Hash with crypto/md5 implementation")
 }
 
-func appendInt32(
-	dst []byte,
-	value int32,
-) []byte {
+func appendInt32(dst []byte, value int32) []byte {
 
 	var b [4]byte
 
@@ -840,8 +834,7 @@ func bytesIndexZero(b []byte) int {
 	return -1
 }
 
-func (p *PGConnection) ExecPrepared(query string, args ...any,
-) (nullRows [][]bool, dataRows [][]string, columns []string, types []string, err error) {
+func (p *PGConnection) ExecPrepared(query string, args ...any) (nullRows [][]bool, dataRows [][]string, columns []string, types []string, err error) {
 
 	name, ok := p.preparedStmts[query]
 	if !ok {
@@ -915,13 +908,7 @@ func (p *PGConnection) sendExecute() error {
 	return p.sendMessage('E', payload)
 }
 
-func (p *PGConnection) readExecResults() (
-	nullRows [][]bool,
-	dataRows [][]string,
-	columns []string,
-	types []string,
-	err error,
-) {
+func (p *PGConnection) readExecResults() (nullRows [][]bool, dataRows [][]string, columns []string, types []string, err error) {
 	for {
 		msgType, payload, err := p.readMessage()
 		if err != nil {
@@ -990,11 +977,7 @@ func (p *PGConnection) readExecResults() (
 	}
 }
 
-func (p *PGConnection) sendParse(
-	name string,
-	query string,
-	numParams int,
-) error {
+func (p *PGConnection) sendParse(name string, query string, numParams int) error {
 
 	payload := make([]byte, 0)
 
@@ -1028,10 +1011,7 @@ func appendInt16(dst []byte, value int16) []byte {
 	return append(dst, b[:]...)
 }
 
-func (p *PGConnection) sendBind(
-	statementName string,
-	args []any,
-) error {
+func (p *PGConnection) sendBind(statementName string, args []any) error {
 
 	payload := make([]byte, 0)
 
