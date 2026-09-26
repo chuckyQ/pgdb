@@ -1006,6 +1006,9 @@ func (c *Connection) readExecResults() (nullRows [][]bool, dataRows [][]string, 
 			// NoticeResponse.
 			fmt.Printf("Notice: %s\n", parseError(payload))
 
+		case 'n':
+			// No data, ignore for now
+
 		case 'Z':
 			// ReadyForQuery.
 			return nullRows, dataRows, columns, types, nil
