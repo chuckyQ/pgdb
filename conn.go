@@ -1,4 +1,4 @@
-package pgdb
+package psql
 
 import (
 	"bufio"
