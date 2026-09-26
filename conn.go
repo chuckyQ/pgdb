@@ -553,7 +553,10 @@ func (c *Connection) readResults() (nullRows [][]bool, dataRows [][]string, colu
 
 		case 'T':
 			// RowDescription.
-			tableHeaderDescriptors := parseRowDescription(payload)
+			tableHeaderDescriptors, err := parseRowDescription(payload)
+			if err != nil {
+				return nil, nil, nil, nil, err
+			}
 			for _, t := range tableHeaderDescriptors {
 				oid := t.dataTypeOid
 				val := int(binary.BigEndian.Uint32(oid))
@@ -614,33 +617,41 @@ type tableRowDescription struct {
 	formatCode            []byte
 }
 
-func parseRowDescription(payload []byte) []*tableRowDescription {
-
+func parseRowDescription(payload []byte) ([]*tableRowDescription, error) {
 	if len(payload) < 2 {
-		return []*tableRowDescription{}
+		return nil, errors.New("invalid RowDescription")
 	}
 
 	count := int(binary.BigEndian.Uint16(payload[:2]))
 	pos := 2
 
-	tableRowDescriptors := []*tableRowDescription{}
+	result := make([]*tableRowDescription, 0, count)
+
 	for i := 0; i < count; i++ {
+		if pos >= len(payload) {
+			return nil, fmt.Errorf(
+				"RowDescription ended before column %d",
+				i,
+			)
+		}
 
 		end := bytesIndexZero(payload[pos:])
 		if end < 0 {
-			break
+			return nil, fmt.Errorf(
+				"missing terminator for column %d",
+				i,
+			)
 		}
 
 		name := string(payload[pos : pos+end])
 		pos += end + 1
 
-		// Table OID
 		if pos+18 > len(payload) {
-			break
+			return nil, fmt.Errorf("column %d has incomplete descriptor", i)
 		}
 
 		t := &tableRowDescription{
-			name: strings.TrimSpace(name),
+			name: name,
 		}
 
 		t.tableOid = payload[pos : pos+4]
@@ -655,16 +666,24 @@ func parseRowDescription(payload []byte) []*tableRowDescription {
 		t.dataTypeSize = payload[pos : pos+2]
 		pos += 2
 
-		t.typeModifier = payload[pos : pos+2]
+		t.typeModifier = payload[pos : pos+4]
 		pos += 4
 
 		t.formatCode = payload[pos : pos+2]
 		pos += 2
 
-		tableRowDescriptors = append(tableRowDescriptors, t)
+		result = append(result, t)
 	}
 
-	return tableRowDescriptors
+	if len(result) != count {
+		return nil, fmt.Errorf(
+			"RowDescription: expected %d columns, parsed %d",
+			count,
+			len(result),
+		)
+	}
+
+	return result, nil
 }
 
 // parseDataRow parses a DataRow message.
@@ -838,11 +857,6 @@ func bytesIndexZero(b []byte) int {
 
 func (c *Connection) ExecPrepared(query string, args ...any) (nullRows [][]bool, dataRows [][]string, columns []string, types []string, err error) {
 
-	name, ok := c.preparedStmts[query]
-	if !ok {
-
-	}
-
 	// ---------------------------------------------------------
 	// Parse
 	// ---------------------------------------------------------
@@ -859,6 +873,9 @@ func (c *Connection) ExecPrepared(query string, args ...any) (nullRows [][]bool,
 	// Using zero OIDs tells PostgreSQL to infer the parameter
 	// types from the SQL statement.
 	//
+
+	name := "query_" + hex.EncodeToString([]byte(query))
+
 	if err := c.sendParse(name, query, len(args)); err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -867,6 +884,11 @@ func (c *Connection) ExecPrepared(query string, args ...any) (nullRows [][]bool,
 	// Bind
 	// ---------------------------------------------------------
 	if err := c.sendBind(name, args); err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	// Describe unnamed portal.
+	if err := c.sendDescribePortal(); err != nil {
 		return nil, nil, nil, nil, err
 	}
 
@@ -910,9 +932,22 @@ func (c *Connection) sendExecute() error {
 	return c.sendMessage('E', payload)
 }
 
+func (c *Connection) sendDescribePortal() error {
+	payload := make([]byte, 0, 2)
+
+	// 'P' = portal
+	payload = append(payload, 'P')
+
+	// Empty portal name = unnamed portal.
+	payload = append(payload, 0)
+
+	return c.sendMessage('D', payload)
+}
+
 func (c *Connection) readExecResults() (nullRows [][]bool, dataRows [][]string, columns []string, types []string, err error) {
 	for {
 		msgType, payload, err := c.readMessage()
+		fmt.Println(string(msgType))
 		if err != nil {
 			return nullRows, dataRows, columns, types, err
 		}
@@ -928,19 +963,28 @@ func (c *Connection) readExecResults() (nullRows [][]bool, dataRows [][]string, 
 		case 'T':
 			// RowDescription.
 
-			tableHeaderDescriptors := parseRowDescription(payload)
+			tableHeaderDescriptors, err := parseRowDescription(payload)
+			if err != nil {
+				return nil, nil, nil, nil, err
+			}
+			columns = make([]string, 0, len(tableHeaderDescriptors))
+			types = make([]string, 0, len(tableHeaderDescriptors))
+
+			fmt.Printf("RowDescription: %d columns\n", len(tableHeaderDescriptors))
 
 			for _, descriptor := range tableHeaderDescriptors {
-				oid := descriptor.dataTypeOid
-				val := int(binary.BigEndian.Uint32(oid))
+				oid := binary.BigEndian.Uint32(
+					descriptor.dataTypeOid,
+				)
 
-				typ, ok := c.oid2typ[val]
+				typ, ok := c.oid2typ[int(oid)]
 				if !ok {
 					typ = "<unknown>"
 				}
 
-				types = append(types, typ)
 				columns = append(columns, descriptor.name)
+
+				types = append(types, typ)
 			}
 
 		case 'D':
@@ -1023,6 +1067,7 @@ func (c *Connection) sendBind(statementName string, args []any) error {
 	//
 	// Empty portal name means the unnamed portal.
 	//
+
 	payload = append(payload, 0)
 
 	// ---------------------------------------------------------
