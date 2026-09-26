@@ -947,7 +947,6 @@ func (c *Connection) sendDescribePortal() error {
 func (c *Connection) readExecResults() (nullRows [][]bool, dataRows [][]string, columns []string, types []string, err error) {
 	for {
 		msgType, payload, err := c.readMessage()
-		fmt.Println(string(msgType))
 		if err != nil {
 			return nullRows, dataRows, columns, types, err
 		}
@@ -969,8 +968,6 @@ func (c *Connection) readExecResults() (nullRows [][]bool, dataRows [][]string, 
 			}
 			columns = make([]string, 0, len(tableHeaderDescriptors))
 			types = make([]string, 0, len(tableHeaderDescriptors))
-
-			fmt.Printf("RowDescription: %d columns\n", len(tableHeaderDescriptors))
 
 			for _, descriptor := range tableHeaderDescriptors {
 				oid := binary.BigEndian.Uint32(
