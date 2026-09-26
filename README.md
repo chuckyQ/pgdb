@@ -1,4 +1,4 @@
-# pgdb
+# psql
 Lightweight library for interacting with Postgres using a pure Golang implementation
 
 ## Example
@@ -8,13 +8,15 @@ package main
 
 import (
 	"fmt"
-
-	"github.com/chuckyQ/pgdb"
+	"context"
+	"github.com/chuckyQ/psql"
 )
 
 func main() {
 
-	conn, err := pgdb.Connect("127.0.0.1", 5432, "postgres", "postgres", "mypassword")
+	ctx := context.TODO()
+
+	conn, err := psql.Connect(ctx, "127.0.0.1", 5432, "postgres", "postgres", "mypassword")
 	if err != nil {
 		fmt.Println(err.Error())
 		return
