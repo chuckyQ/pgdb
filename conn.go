@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"reflect"
 	"strconv"
 	"strings"
 )
@@ -947,6 +948,7 @@ func (c *Connection) sendDescribePortal() error {
 func (c *Connection) readExecResults() (nullRows [][]bool, dataRows [][]string, columns []string, types []string, err error) {
 	for {
 		msgType, payload, err := c.readMessage()
+
 		if err != nil {
 			return nullRows, dataRows, columns, types, err
 		}
@@ -1109,15 +1111,9 @@ func (c *Connection) sendBind(statementName string, args []any) error {
 			return err
 		}
 
-		payload = appendInt32(
-			payload,
-			int32(len(value)),
-		)
+		payload = appendInt32(payload, int32(len(value)))
 
-		payload = append(
-			payload,
-			[]byte(value)...,
-		)
+		payload = append(payload, []byte(value)...)
 	}
 
 	// ---------------------------------------------------------
@@ -1132,6 +1128,59 @@ func (c *Connection) sendBind(statementName string, args []any) error {
 }
 
 func parameterString(value any) (string, error) {
+
+	if value == nil {
+		return "", nil
+	}
+
+	rv := reflect.ValueOf(value)
+
+	// Dereference pointers.
+	for rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return "", nil
+		}
+
+		rv = rv.Elem()
+	}
+
+	// Handle slices and arrays.
+	if rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array {
+		var b strings.Builder
+
+		b.WriteByte('{')
+
+		for i := 0; i < rv.Len(); i++ {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+
+			element := rv.Index(i)
+
+			// Handle interface{} elements.
+			if element.Kind() == reflect.Interface {
+				if element.IsNil() {
+					b.WriteString("NULL")
+					continue
+				}
+
+				element = element.Elem()
+			}
+
+			s, err := parameterString(element.Interface())
+			if err != nil {
+				return "", err
+			}
+
+			b.WriteString(s)
+		}
+
+		b.WriteByte('}')
+
+		return b.String(), nil
+	}
+
+	value = rv.Interface()
 
 	switch v := value.(type) {
 
@@ -1178,20 +1227,10 @@ func parameterString(value any) (string, error) {
 		return strconv.FormatUint(v, 10), nil
 
 	case float32:
-		return strconv.FormatFloat(
-			float64(v),
-			'g',
-			-1,
-			32,
-		), nil
+		return strconv.FormatFloat(float64(v), 'g', -1, 32), nil
 
 	case float64:
-		return strconv.FormatFloat(
-			v,
-			'g',
-			-1,
-			64,
-		), nil
+		return strconv.FormatFloat(v, 'g', -1, 64), nil
 
 	case fmt.Stringer:
 		return v.String(), nil
