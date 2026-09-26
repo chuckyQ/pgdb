@@ -2,6 +2,7 @@ package pgdb
 
 import (
 	"bufio"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -16,38 +17,39 @@ import (
 	"strings"
 )
 
-type PGConnection struct {
+type Connection struct {
 	conn          net.Conn
 	reader        *bufio.Reader
 	oid2typ       map[int]string
 	preparedStmts map[string]string
 }
 
-func (p *PGConnection) Close() {
-	if p.conn != nil {
-		p.conn.Close()
+func (c *Connection) Close() {
+	if c.conn != nil {
+		c.conn.Close()
 	}
 }
 
-func Connect(host string, port int, database, username, password string) (*PGConnection, error) {
+func Connect(ctx context.Context, host string, port int, database, username, password string) (*Connection, error) {
 
-	conn, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	d := net.Dialer{}
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 
 	if err != nil {
 		return nil, err
 	}
-	p := &PGConnection{
+	c := &Connection{
 		conn:          conn,
 		reader:        bufio.NewReader(conn),
 		preparedStmts: make(map[string]string),
 	}
 
-	err = p.startup(database, username, password)
+	err = c.startup(database, username, password)
 	if err != nil {
 		return nil, err
 	}
 
-	_, data, _, _, err := p.Query("SELECT oid, typname FROM pg_type;")
+	_, data, _, _, err := c.Query("SELECT oid, typname FROM pg_type;")
 
 	if err != nil {
 		return nil, err
@@ -62,15 +64,15 @@ func Connect(host string, port int, database, username, password string) (*PGCon
 		m[i] = row[1]
 	}
 
-	p.oid2typ = m
+	c.oid2typ = m
 
-	return p, nil
+	return c, nil
 
 }
 
 // startup sends the PostgreSQL StartupMessage and handles
 // authentication until AuthenticationOk is received.
-func (p *PGConnection) startup(database string, username string, password string) error {
+func (c *Connection) startup(database string, username string, password string) error {
 
 	// StartupMessage:
 	//
@@ -103,13 +105,13 @@ func (p *PGConnection) startup(database string, username string, password string
 	binary.BigEndian.PutUint32(msg, uint32(len(body)+4))
 	msg = append(msg, body...)
 
-	if _, err := p.conn.Write(msg); err != nil {
+	if _, err := c.conn.Write(msg); err != nil {
 		return err
 	}
 
-	// Authentication loop.
+	// Authentication looc.
 	for {
-		msgType, payload, err := p.readMessage()
+		msgType, payload, err := c.readMessage()
 		if err != nil {
 			return err
 		}
@@ -118,7 +120,7 @@ func (p *PGConnection) startup(database string, username string, password string
 
 		case 'R':
 			// Authentication request.
-			if err := p.handleAuthentication(payload, username, password); err != nil {
+			if err := c.handleAuthentication(payload, username, password); err != nil {
 				return err
 			}
 
@@ -158,7 +160,7 @@ func (p *PGConnection) startup(database string, username string, password string
 }
 
 // handleAuthentication processes PostgreSQL Authentication messages.
-func (p *PGConnection) handleAuthentication(payload []byte, username string, password string) error {
+func (c *Connection) handleAuthentication(payload []byte, username string, password string) error {
 
 	if len(payload) < 4 {
 		return errors.New("invalid Authentication message")
@@ -180,7 +182,7 @@ func (p *PGConnection) handleAuthentication(payload []byte, username string, pas
 		// 'p'
 		// Int32 length
 		// password + '\0'
-		return p.sendPassword(password)
+		return c.sendPassword(password)
 
 	case 5:
 		// AuthenticationMD5Password.
@@ -189,7 +191,7 @@ func (p *PGConnection) handleAuthentication(payload []byte, username string, pas
 		}
 
 		salt := payload[4:8]
-		return p.sendMD5Password(username, password, salt)
+		return c.sendMD5Password(username, password, salt)
 
 	case 10:
 		// AuthenticationSASL.
@@ -200,7 +202,7 @@ func (p *PGConnection) handleAuthentication(payload []byte, username string, pas
 		//
 		// SCRAM-SHA-256
 		//
-		return p.handleSCRAM(username, password)
+		return c.handleSCRAM(username, password)
 
 	default:
 		return fmt.Errorf("unsupported PostgreSQL authentication type: %d", authType)
@@ -208,9 +210,9 @@ func (p *PGConnection) handleAuthentication(payload []byte, username string, pas
 }
 
 // sendPassword sends a PasswordMessage.
-func (p *PGConnection) sendPassword(password string) error {
+func (c *Connection) sendPassword(password string) error {
 	payload := append([]byte(password), 0)
-	return p.sendMessage('p', payload)
+	return c.sendMessage('p', payload)
 }
 
 // sendMessage writes a normal PostgreSQL frontend message.
@@ -223,7 +225,7 @@ func (p *PGConnection) sendPassword(password string) error {
 //
 // The length includes the four length bytes but does not
 // include the message-type byte.
-func (p *PGConnection) sendMessage(msgType byte, payload []byte) error {
+func (c *Connection) sendMessage(msgType byte, payload []byte) error {
 
 	length := 4 + len(payload)
 
@@ -238,15 +240,15 @@ func (p *PGConnection) sendMessage(msgType byte, payload []byte) error {
 
 	copy(buf[5:], payload)
 
-	_, err := p.conn.Write(buf)
+	_, err := c.conn.Write(buf)
 
 	return err
 }
 
 // readMessage reads one PostgreSQL backend message.
-func (p *PGConnection) readMessage() (byte, []byte, error) {
+func (c *Connection) readMessage() (byte, []byte, error) {
 
-	msgType, err := p.reader.ReadByte()
+	msgType, err := c.reader.ReadByte()
 	if err != nil {
 		return 0, nil, err
 	}
@@ -254,7 +256,7 @@ func (p *PGConnection) readMessage() (byte, []byte, error) {
 	var lengthBytes [4]byte
 
 	if _, err := io.ReadFull(
-		p.reader,
+		c.reader,
 		lengthBytes[:],
 	); err != nil {
 		return 0, nil, err
@@ -270,32 +272,32 @@ func (p *PGConnection) readMessage() (byte, []byte, error) {
 
 	payload := make([]byte, payloadLength)
 
-	if _, err := io.ReadFull(p.reader, payload); err != nil {
+	if _, err := io.ReadFull(c.reader, payload); err != nil {
 		return 0, nil, err
 	}
 
 	return msgType, payload, nil
 }
 
-func (p *PGConnection) Query(query string) (nulls [][]bool, data [][]string, columns []string, types []string, err error) {
+func (c *Connection) Query(query string) (nulls [][]bool, data [][]string, columns []string, types []string, err error) {
 
-	err = p.sendQuery(query)
+	err = c.sendQuery(query)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
 
-	nulls, data, columns, types, err = p.readResults()
+	nulls, data, columns, types, err = c.readResults()
 	return nulls, data, columns, types, err
 
 }
 
-func (p *PGConnection) Exec(query string, args ...any) (nulls [][]bool, data [][]string, columns []string, types []string, err error) {
+func (c *Connection) Exec(query string, args ...any) (nulls [][]bool, data [][]string, columns []string, types []string, err error) {
 
 	if len(args) == 0 {
-		return p.Query(query)
+		return c.Query(query)
 	}
 
-	return p.ExecPrepared(query, args...)
+	return c.ExecPrepared(query, args...)
 
 }
 
@@ -307,13 +309,13 @@ func (p *PGConnection) Exec(query string, args ...any) (nulls [][]bool, data [][
 //	Int32 length
 //	query string
 //	'\0'
-func (p *PGConnection) sendQuery(query string) error {
+func (c *Connection) sendQuery(query string) error {
 	payload := append([]byte(query), 0)
-	return p.sendMessage('Q', payload)
+	return c.sendMessage('Q', payload)
 }
 
 // sendMD5Password implements PostgreSQL's MD5 password authentication.
-func (p *PGConnection) sendMD5Password(username string, password string, salt []byte) error {
+func (c *Connection) sendMD5Password(username string, password string, salt []byte) error {
 
 	// PostgreSQL MD5 authentication is:
 	//
@@ -329,11 +331,11 @@ func (p *PGConnection) sendMD5Password(username string, password string, salt []
 
 	result := "md5" + hex.EncodeToString(h2[:])
 
-	return p.sendPassword(result)
+	return c.sendPassword(result)
 }
 
 // handleSCRAM performs the SCRAM-SHA-256 exchange.
-func (p *PGConnection) handleSCRAM(username string, password string) error {
+func (c *Connection) handleSCRAM(username string, password string) error {
 
 	// ---------------------------------------------------------
 	// SASLInitialResponse
@@ -374,7 +376,7 @@ func (p *PGConnection) handleSCRAM(username string, password string) error {
 	payload = appendInt32(payload, int32(len(clientFirstMessage)))
 	payload = append(payload, []byte(clientFirstMessage)...)
 
-	if err := p.sendMessage('p', payload); err != nil {
+	if err := c.sendMessage('p', payload); err != nil {
 		return err
 	}
 
@@ -382,7 +384,7 @@ func (p *PGConnection) handleSCRAM(username string, password string) error {
 	// AuthenticationSASLContinue
 	// ---------------------------------------------------------
 
-	msgType, serverPayload, err := p.readMessage()
+	msgType, serverPayload, err := c.readMessage()
 	if err != nil {
 		return err
 	}
@@ -470,7 +472,7 @@ func (p *PGConnection) handleSCRAM(username string, password string) error {
 		clientFinalWithoutProof +
 			",p=" + proof
 
-	if err := p.sendMessage('p', []byte(clientFinalMessage)); err != nil {
+	if err := c.sendMessage('p', []byte(clientFinalMessage)); err != nil {
 		return err
 	}
 
@@ -478,7 +480,7 @@ func (p *PGConnection) handleSCRAM(username string, password string) error {
 	// AuthenticationSASLFinal
 	// ---------------------------------------------------------
 
-	msgType, serverPayload, err = p.readMessage()
+	msgType, serverPayload, err = c.readMessage()
 	if err != nil {
 		return err
 	}
@@ -539,10 +541,10 @@ func parseSCRAMAttributes(s string) map[string]string {
 }
 
 // readResults consumes PostgreSQL messages resulting from the query.
-func (p *PGConnection) readResults() (nullRows [][]bool, dataRows [][]string, columns []string, types []string, err error) {
+func (c *Connection) readResults() (nullRows [][]bool, dataRows [][]string, columns []string, types []string, err error) {
 
 	for {
-		msgType, payload, err := p.readMessage()
+		msgType, payload, err := c.readMessage()
 		if err != nil {
 			return nullRows, dataRows, columns, types, err
 		}
@@ -555,7 +557,7 @@ func (p *PGConnection) readResults() (nullRows [][]bool, dataRows [][]string, co
 			for _, t := range tableHeaderDescriptors {
 				oid := t.dataTypeOid
 				val := int(binary.BigEndian.Uint32(oid))
-				typ, ok := p.oid2typ[val]
+				typ, ok := c.oid2typ[val]
 				if !ok {
 					typ = "<unknown>"
 				}
@@ -834,9 +836,9 @@ func bytesIndexZero(b []byte) int {
 	return -1
 }
 
-func (p *PGConnection) ExecPrepared(query string, args ...any) (nullRows [][]bool, dataRows [][]string, columns []string, types []string, err error) {
+func (c *Connection) ExecPrepared(query string, args ...any) (nullRows [][]bool, dataRows [][]string, columns []string, types []string, err error) {
 
-	name, ok := p.preparedStmts[query]
+	name, ok := c.preparedStmts[query]
 	if !ok {
 
 	}
@@ -857,21 +859,21 @@ func (p *PGConnection) ExecPrepared(query string, args ...any) (nullRows [][]boo
 	// Using zero OIDs tells PostgreSQL to infer the parameter
 	// types from the SQL statement.
 	//
-	if err := p.sendParse(name, query, len(args)); err != nil {
+	if err := c.sendParse(name, query, len(args)); err != nil {
 		return nil, nil, nil, nil, err
 	}
 
 	// ---------------------------------------------------------
 	// Bind
 	// ---------------------------------------------------------
-	if err := p.sendBind(name, args); err != nil {
+	if err := c.sendBind(name, args); err != nil {
 		return nil, nil, nil, nil, err
 	}
 
 	// ---------------------------------------------------------
 	// Execute
 	// ---------------------------------------------------------
-	if err := p.sendExecute(); err != nil {
+	if err := c.sendExecute(); err != nil {
 		return nil, nil, nil, nil, err
 	}
 
@@ -882,17 +884,17 @@ func (p *PGConnection) ExecPrepared(query string, args ...any) (nullRows [][]boo
 	// Sync tells PostgreSQL to finish this extended-query
 	// cycle and return ReadyForQuery.
 	//
-	if err := p.sendMessage('S', nil); err != nil {
+	if err := c.sendMessage('S', nil); err != nil {
 		return nil, nil, nil, nil, err
 	}
 
 	// ---------------------------------------------------------
 	// Read responses
 	// ---------------------------------------------------------
-	return p.readExecResults()
+	return c.readExecResults()
 }
 
-func (p *PGConnection) sendExecute() error {
+func (c *Connection) sendExecute() error {
 
 	payload := make([]byte, 0)
 
@@ -905,12 +907,12 @@ func (p *PGConnection) sendExecute() error {
 	// 0 means "no limit".
 	payload = appendInt32(payload, 0)
 
-	return p.sendMessage('E', payload)
+	return c.sendMessage('E', payload)
 }
 
-func (p *PGConnection) readExecResults() (nullRows [][]bool, dataRows [][]string, columns []string, types []string, err error) {
+func (c *Connection) readExecResults() (nullRows [][]bool, dataRows [][]string, columns []string, types []string, err error) {
 	for {
-		msgType, payload, err := p.readMessage()
+		msgType, payload, err := c.readMessage()
 		if err != nil {
 			return nullRows, dataRows, columns, types, err
 		}
@@ -932,7 +934,7 @@ func (p *PGConnection) readExecResults() (nullRows [][]bool, dataRows [][]string
 				oid := descriptor.dataTypeOid
 				val := int(binary.BigEndian.Uint32(oid))
 
-				typ, ok := p.oid2typ[val]
+				typ, ok := c.oid2typ[val]
 				if !ok {
 					typ = "<unknown>"
 				}
@@ -977,7 +979,7 @@ func (p *PGConnection) readExecResults() (nullRows [][]bool, dataRows [][]string
 	}
 }
 
-func (p *PGConnection) sendParse(name string, query string, numParams int) error {
+func (c *Connection) sendParse(name string, query string, numParams int) error {
 
 	payload := make([]byte, 0)
 
@@ -997,7 +999,7 @@ func (p *PGConnection) sendParse(name string, query string, numParams int) error
 		payload = appendInt32(payload, 0)
 	}
 
-	return p.sendMessage('P', payload)
+	return c.sendMessage('P', payload)
 }
 
 func appendInt16(dst []byte, value int16) []byte {
@@ -1011,7 +1013,7 @@ func appendInt16(dst []byte, value int16) []byte {
 	return append(dst, b[:]...)
 }
 
-func (p *PGConnection) sendBind(statementName string, args []any) error {
+func (c *Connection) sendBind(statementName string, args []any) error {
 
 	payload := make([]byte, 0)
 
@@ -1081,7 +1083,7 @@ func (p *PGConnection) sendBind(statementName string, args []any) error {
 	//
 	payload = appendInt16(payload, 0)
 
-	return p.sendMessage('B', payload)
+	return c.sendMessage('B', payload)
 }
 
 func parameterString(value any) (string, error) {
